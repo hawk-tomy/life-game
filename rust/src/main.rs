@@ -2,15 +2,16 @@ use anyhow::{anyhow, ensure, Error, Result};
 use chrono::prelude::Local;
 use clap::{ArgGroup, Parser};
 use crossterm::{
-    cursor::{CursorShape, Hide, MoveTo, SetCursorShape, Show},
+    cursor::{Hide, MoveTo, SetCursorStyle, Show},
     event::{poll, read, Event, KeyCode, KeyEvent, KeyEventKind},
     execute, queue,
-    terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{size, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use once_cell::sync::Lazy;
 use rand::{thread_rng, Rng};
 use regex::Regex;
 use std::{
+    cmp::max,
     concat,
     fmt::Display,
     fs::{read_to_string, write},
@@ -128,9 +129,22 @@ impl FromStr for Size {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        let (width, height) = point_from_str(s)?;
+        let (width, height) = if s == "M" {
+            let (w, h) = size()?;
+            (
+                w,
+                h.checked_sub(5).ok_or(anyhow!("Terminal is too small!"))?,
+            )
+        } else {
+            point_from_str(s)?
+        };
         Ok(Self { width, height })
     }
+}
+
+fn min_15(v: &str) -> Result<u64> {
+    let v = v.parse::<u64>()?;
+    Ok(max(v, 15))
 }
 
 #[derive(Parser, Debug)]
@@ -138,13 +152,20 @@ impl FromStr for Size {
     ArgGroup::new("initialize").required(false).args(["file", "random"])
 ))]
 struct Args {
-    #[arg(short, long, default_value = "160:32")]
+    #[arg(
+        short,
+        long,
+        default_value = "160:32",
+        default_value_if("max", "true", "M")
+    )]
     size: Size,
+    #[arg(short = 'M', long, conflicts_with = "size")]
+    max: bool,
     #[arg(short, long)]
     random: bool,
-    #[arg(short, long, value_name = "FILE", conflicts_with_all = ["size", "random"])]
+    #[arg(short, long, value_name = "FILE", conflicts_with_all = ["size", "random", "max"])]
     file: Option<PathBuf>,
-    #[arg(short, long, default_value = "100")]
+    #[arg(short, long, default_value = "100", help = "ms. min: 15ms.", value_parser = min_15)]
     duration: u64,
 }
 
@@ -161,10 +182,10 @@ impl Args {
 
         let width = cap.name("width").unwrap().as_str().parse::<u16>()?;
         let height = cap.name("height").unwrap().as_str().parse::<u16>()?;
-        let length = width * height;
+        let length = width as usize * height as usize;
 
         let data = cap.name("data").unwrap().as_str();
-        let mut game: Vec<bool> = Vec::with_capacity(length as usize);
+        let mut game: Vec<bool> = Vec::with_capacity(length);
         for c in data.chars() {
             match c {
                 '\n' => continue,
@@ -174,7 +195,7 @@ impl Args {
             }
         }
 
-        ensure!(length as usize == game.len(), "Invalid Data!");
+        ensure!(length == game.len(), "Invalid Data!");
 
         Ok(game)
     }
@@ -185,7 +206,7 @@ struct State {
     size: Size,
     time: usize,
     duration: u64,
-    len: u16,
+    len: usize,
 }
 
 impl Display for State {
@@ -200,10 +221,7 @@ impl State {
             size: args.size,
             time: 0,
             duration: args.duration,
-            len: args
-                .size
-                .height
-                .checked_mul(args.size.width)
+            len: usize::checked_mul(args.size.width.into(), args.size.height.into())
                 .ok_or_else(|| anyhow!("overflow"))?,
         })
     }
@@ -226,7 +244,7 @@ struct Game {
 
 impl Display for Game {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        write!(f, "{}\n\n{}", self.show_board(), self.state)
+        write!(f, "{}\n{}", self.show_board(), self.state)
     }
 }
 
@@ -237,11 +255,11 @@ impl Game {
         let game = if let Some(path) = args.file.clone() {
             args.init_from_file(path)?
         } else if args.random {
-            let mut base = vec![false; state.len as usize];
+            let mut base = vec![false; state.len];
             thread_rng().fill(&mut base[..]);
             base
         } else {
-            vec![false; state.len as usize]
+            vec![false; state.len]
         };
 
         Ok(Self { game, state })
@@ -251,10 +269,13 @@ impl Game {
         let chars: Vec<char> = self
             .game
             .iter()
-            .map(|v| if *v { '@' } else { '-' })
+            .map(|&v| if v { '@' } else { '-' })
             .collect();
-        let mut formatted =
-            String::with_capacity((self.state.len + self.state.size.height) as usize);
+        let mut formatted = String::with_capacity(
+            usize::checked_add(self.state.len, self.state.size.height.into())
+                .ok_or_else(|| anyhow!("overflow"))
+                .unwrap(),
+        );
 
         let mut i = 0;
         for _ in 0..self.state.size.height {
@@ -273,10 +294,10 @@ impl Game {
             .game
             .iter()
             .enumerate()
-            .map(|(i, v)| -> Result<bool> {
+            .map(|(i, &v)| -> Result<bool> {
                 let pts = self.get_pt(i)?;
-                let alive = pts.iter().filter(|j| self.game[**j as usize]).count();
-                Ok(if *v {
+                let alive = pts.iter().filter(|&&j| self.game[j]).count();
+                Ok(if v {
                     // idx: alive
                     1 < alive && alive < 4
                 } else {
@@ -288,63 +309,18 @@ impl Game {
         Ok(())
     }
 
-    fn get_pt(&self, idx: usize) -> Result<[u16; 8]> {
+    fn get_pt(&self, idx: usize) -> Result<[usize; 8]> {
         // cu ru rm rd cd ld lm lu
-        let idx: u16 = idx.try_into()?;
+        let idx: u32 = idx.try_into()?;
 
-        let width = self.state.size.width;
-        let size = self.state.len;
+        let width = self.state.size.width.into();
+        let size: u32 = self.state.len.try_into()?;
 
-        let left = idx % width == 0;
-        let right = idx % width == width - 1;
-
-        // <base>
-        // (+/- 1, +/- width, left/right=+/- width)
-        // 000 = idx = cm
-        // first column: move left/right
-        // second column: move up/down
-        // last column: left or right
-        // first "size" and "% size": top or bottom
-        // ---
-        // lu cu ru   (            --+ 0-0 +-- )
-        // lm cm rm = ( size + idx -0+ 000 +0- ) % size
-        // ld cd rd   (            -++ 0+0 ++- )
-
-        // e.g. 3x4; idx=1, idx=9:
-        // ---
-        // 0  1  2        12 13 14
-        // 3  4  5 + size 15 16 17
-        // 6  7  8  --->  18 19 20
-        // 9 10 11        21 22 23
-        // ---
-        // :: idx=1;
-        // base = idx + 12 = 13; not left, not right
-        // ---
-        // lu cu ru   ( --+ 0-0 +--       )          (  9 10 11 )        = 9 10 11
-        // lm cm rm = ( -0+ 000 +0- + idx ) % size = ( 12 13 14 ) % size = 0  1  2
-        // ld cd rd   ( -++ 0+0 ++-       )          ( 15 16 17 )        = 3  4  5
-        // --> pls see before table
-        // lu cu ru   9 10 11
-        // lm cm rm = 0  1  2
-        // ld cd rd   3  4  5
-        // ---
-        // :: idx=9;
-        // base = idx + 12 = 21; left, not right
-        // ---
-        // lu cu ru   ( --+ 0-0 +--       )          ( 20 18 19 )        =  8  6   7
-        // lm cm rm = ( -0+ 000 +0- + idx ) % size = ( 23 21 22 ) % size = 11  9  10
-        // ld cd rd   ( -++ 0+0 ++-       )          ( 26 24 25 )        =  2  0   1
-        // --> pls see before table
-        // lu cu ru    8  6   7
-        // lm cm rm = 11  9  10
-        // ld cd rd    2  0   1
-        // ---
+        let left_weight = if idx % width == 0 { width } else { 0 };
+        let right_weight = if idx % width == width - 1 { width } else { 0 };
 
         let cu = (size + idx - width) % size;
         let cd = (size + idx + width) % size;
-
-        let right_weight = if right { width } else { 0 };
-        let left_weight = if left { width } else { 0 };
 
         let ru = (size + idx + 1 - right_weight - width) % size;
         let rm = (size + idx + 1 - right_weight) % size;
@@ -354,7 +330,7 @@ impl Game {
         let lm = (size + idx - 1 + left_weight) % size;
         let ld = (size + idx - 1 + left_weight + width) % size;
 
-        Ok([cu, ru, rm, rd, cd, ld, lm, lu])
+        Ok([cu, ru, rm, rd, cd, ld, lm, lu].map(|v| v as usize))
     }
 
     fn check_pos(&self, pos: (u16, u16)) -> Result<()> {
@@ -389,11 +365,11 @@ impl Game {
     fn save(&self) -> Result<String> {
         let path = Local::now().format("./%F_%H.%M.%ST%z.txt").to_string();
         let mut data = format!("{}:{}", self.state.size.width, self.state.size.height);
-        for (i, v) in self.game.iter().enumerate() {
+        for (i, &v) in self.game.iter().enumerate() {
             if i % self.state.size.width as usize == 0 {
                 data.push('\n')
             }
-            data.push(if *v { '1' } else { '0' });
+            data.push(if v { '1' } else { '0' });
         }
         write(&path, data)?;
 
@@ -428,7 +404,7 @@ fn main_loop(stdout: &mut Stdout, game: &mut Game) -> Result<()> {
     loop {
         queue!(stdout, MoveTo(0, 0), Clear(ClearType::FromCursorDown))?;
         println!(
-            "{}\n<q>: quit program.\t<a>: auto run.\t<e>: switch to editor.\t<s>: save to file.\t<CR>: next.\n\n{}",
+            "{}\n<q>: quit program.\t<a>: auto run.\t<e>: switch to editor.\t<s>: save to file.\t<CR>: next.\n{}",
             game, if let Some(msg) = info { msg } else { "".to_string() }
         );
         info = None;
@@ -436,9 +412,9 @@ fn main_loop(stdout: &mut Stdout, game: &mut Game) -> Result<()> {
             press!(char 'q') => break,
             press!(enter) => game.next()?,
             press!(char 'e') => {
-                execute!(stdout, Show, SetCursorShape(CursorShape::Block))?;
+                execute!(stdout, Show, SetCursorStyle::BlinkingBlock)?;
                 editor_loop(stdout, game)?;
-                execute!(stdout, Hide, SetCursorShape(CursorShape::Line))?;
+                execute!(stdout, Show, SetCursorStyle::DefaultUserShape)?;
             }
             press!(char 'a') => auto_loop(stdout, game)?,
             press!(char 's') => info = Some(game.save()?),
@@ -455,7 +431,10 @@ fn auto_loop(stdout: &mut Stdout, game: &mut Game) -> Result<()> {
     loop {
         game.next()?;
         queue!(stdout, MoveTo(0, 0), Clear(ClearType::FromCursorDown))?;
-        println!("{}\n<q>: quit auto run.\t", game);
+        println!(
+            "{}\n<q>: quit auto run.\tduration: {}ms",
+            game, game.state.duration
+        );
 
         sleep(dur);
         if poll(zero_sec)? {
@@ -474,7 +453,7 @@ fn editor_loop(stdout: &mut Stdout, game: &mut Game) -> Result<()> {
     loop {
         execute!(stdout, MoveTo(0, 0), Clear(ClearType::FromCursorDown))?;
         println!(
-            "{}\n`<h>`:left\t`<j>`:down\t`<k>`:up\t`<l>`:right\t\n`<CR>`: reverse.\t`q`: quit editor mode.",
+            "{}\n`<h>`:left\t`<j>`:down\t`<k>`:up\t`<l>`:right\t`<CR>`: reverse.\t`q`: quit editor mode.\n",
             game
         );
         execute!(stdout, MoveTo(pos.0, pos.1))?;
@@ -485,7 +464,7 @@ fn editor_loop(stdout: &mut Stdout, game: &mut Game) -> Result<()> {
             press!(char 'k') | press!(up) => game.move_to(pos, (0, -1)).unwrap_or(pos),
             press!(char 'l') | press!(right) => game.move_to(pos, (1, 0)).unwrap_or(pos),
             press!(enter) => {
-                let _ = game.set_pos(pos);
+                game.set_pos(pos)?;
                 continue;
             }
             _ => continue,
@@ -502,6 +481,7 @@ mod test {
     fn test_of_test() -> Result<()> {
         let args = Args {
             size: Size::default(),
+            max: false,
             file: None,
             duration: 100,
             random: false,
@@ -537,6 +517,7 @@ mod test {
                 width: 5,
                 height: 5,
             },
+            max: false,
             file: None,
             duration: 100,
             random: false,
@@ -564,6 +545,7 @@ mod test {
                 width: 3,
                 height: 3,
             },
+            max: false,
             file: None,
             duration: 100,
             random: false,
