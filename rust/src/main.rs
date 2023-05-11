@@ -265,6 +265,15 @@ impl Game {
         Ok(Self { game, state })
     }
 
+    fn clear(&mut self) {
+        self.game = vec![false; self.state.len];
+    }
+
+    fn random(&mut self) {
+        self.clear();
+        thread_rng().fill(&mut self.game[..]);
+    }
+
     fn show_board(&self) -> String {
         let chars: Vec<char> = self
             .game
@@ -404,7 +413,7 @@ fn main_loop(stdout: &mut Stdout, game: &mut Game) -> Result<()> {
     loop {
         queue!(stdout, MoveTo(0, 0), Clear(ClearType::FromCursorDown))?;
         println!(
-            "{}\n<q>: quit program.\t<a>: auto run.\t<e>: switch to editor.\t<s>: save to file.\t<CR>: next.\n{}",
+            "{}\n<q>: quit program.\t<a>: auto run.\t<r> regenerate random.\t<e>: switch to editor.\t<s>: save to file.\t<CR>: next.\n{}",
             game, if let Some(msg) = info { msg } else { "".to_string() }
         );
         info = None;
@@ -417,6 +426,7 @@ fn main_loop(stdout: &mut Stdout, game: &mut Game) -> Result<()> {
                 execute!(stdout, Show, SetCursorStyle::DefaultUserShape)?;
             }
             press!(char 'a') => auto_loop(stdout, game)?,
+            press!(char 'r') => game.random(),
             press!(char 's') => info = Some(game.save()?),
             _ => continue,
         };
