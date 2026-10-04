@@ -325,7 +325,7 @@ impl Game {
         let width = self.state.size.width.into();
         let size: u32 = self.state.len.try_into()?;
 
-        let left_weight = if idx % width == 0 { width } else { 0 };
+        let left_weight = if idx.is_multiple_of(width) { width } else { 0 };
         let right_weight = if idx % width == width - 1 { width } else { 0 };
 
         let cu = (size + idx - width) % size;
